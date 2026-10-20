@@ -1,0 +1,1582 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: rgba(0, 0, 0, 0.65); color: #fff; cursor: pointer; text-align: center;
+  }
+  #overlay h1 { margin: 0; font-size: 2rem; }
+  #overlay p { margin: 0; opacity: 0.8; line-height: 1.6; }
+  #crosshair {
+    position: fixed; top: 50%; left: 50%; width: 6px; height: 6px;
+    margin: -3px 0 0 -3px; border-radius: 50%;
+    background: rgba(255, 255, 255, 0.7); pointer-events: none; display: none;
+  }
+  #hint {
+    position: fixed; left: 50%; bottom: 9%; transform: translateX(-50%);
+    padding: 8px 16px; border-radius: 8px; background: rgba(0, 0, 0, 0.55);
+    color: #fff; font-size: 0.95rem; pointer-events: none; display: none;
+    max-width: 92vw; text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <h1>Dashboard 3D</h1>
+  <p>Clique pour entrer dans la salle</p>
+  <p>Z Q S D / flèches : se déplacer · Souris : regarder · Maj : courir · Espace : sauter<br>Échap : libérer la souris</p>
+  <p>E : porter / poser le tonneau · Clic maintenu : retirer le couvercle · F : remettre le couvercle</p>
+</div>
+<div id="crosshair"></div>
+<div id="hint"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// =====================================================================
+//  Utilitaires
+// =====================================================================
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const lerp = THREE.MathUtils.lerp;
+const ss = (x) => { x = Math.min(1, Math.max(0, x)); return x * x * (3 - 2 * x); };
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+
+// =====================================================================
+//  Rendu : trois mondes (salle / extérieur / cabane) reliés par des portails
+// =====================================================================
+const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true });
+renderer.autoClear = false;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const roomScene = new THREE.Scene();
+const outScene  = new THREE.Scene();
+const doorScene = new THREE.Scene();   // la porte appartient aux deux mondes : dessinée à part
+const shedScene = new THREE.Scene();   // la cabane, à l'intérieur du tonneau
+const holdScene = new THREE.Scene();   // le tonneau porté, dessiné par-dessus tout le reste
+const roomRoot  = new THREE.Group(); roomScene.add(roomRoot);
+const doorRoot  = new THREE.Group(); doorScene.add(doorRoot);
+
+const roomMats = [], outMats = [], shedMats = [];   // listes de matériaux (test de stencil par monde)
+const mk = (list, params, Ctor = THREE.MeshStandardMaterial) => { const m = new Ctor(params); list.push(m); return m; };
+
+// ---------- État global ----------
+let world = 'room';      // 'room' | 'out' | 'shed'
+let yaw = 0, pitch = 0;
+let onLadder = false, climbPhase = 0;
+let tube = false;                  // le joueur est dans l'ouverture du tonneau (corps dans le puits, tête encore dehors)
+let vy = 0, grounded = true;
+let velX = 0, velZ = 0;
+let ladderCooldown = 0, ladderLock = 0;
+let jumpQueued = false;
+const GRAVITY = 18, JUMP_V = 6.2;
+
+// ---------- Caméra / joueur ----------
+const EYE_HEIGHT = 1.7;
+const PLAYER_MASS = 70;
+const PLAYER_RADIUS = 0.3;
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.02, 500);
+const player = new THREE.Object3D();
+player.position.set(0, EYE_HEIGHT, 0);
+player.add(camera);
+
+// ---------- Dimensions ----------
+const ROOM_W = 14, ROOM_D = 14, ROOM_H = 4;
+const WALL_T = 0.2;
+const WALL_Z = -ROOM_D / 2 - WALL_T / 2;
+const OPEN_X1 = 2.45, OPEN_X2 = 3.55, OPEN_H = 2.2;
+const DOOR_CX = (OPEN_X1 + OPEN_X2) / 2;
+const JAMB = 0.05;
+const CASING_W = 0.09, CASING_T = 0.025;
+
+const P = 240;                       // l'extérieur est un tore de côté P
+const FOG_COLOR = 0xbfdcf5;
+const ROOM_CLEAR = 0x8d93a0;
+const SHED_CLEAR = 0x0a0705;
+
+// Tonneau
+const BH = 0.9;                      // hauteur
+const BR = 0.46;                     // rayon au ventre
+const B_TOP = 0.40;                  // rayon en haut et en bas
+const HR = 0.32;                     // rayon de l'ouverture
+const LID_T = 0.03, LID_R = 0.43;    // couvercle
+const EDGE = (HR + B_TOP) / 2;       // milieu de la bordure du tonneau
+const HOLE_REF = 50;                 // valeur de stencil du portail du tonneau
+const CARRY = { x: -0.32, y: -1.15, z: -0.95, lean: 0.20, roll: 0.18, slow: 0.55 };   // tonneau porté (repère de la tête)
+
+// Cabane (coordonnées locales) + puits de l'échelle dans le coin fond-droite
+const SHED  = { x1: -2.1, x2: 2.1, z1: -1.7, z2: 1.7, h: 2.6 };
+const SHAFT = { x1: 1.2, x2: 2.1, z1: -1.7, z2: -0.8, top: 5.6 };
+const HOLE_S = new THREE.Vector3(1.72, SHAFT.top, (SHAFT.z1 + SHAFT.z2) / 2);   // centre de l'ouverture, côté cabane
+const LAD_X = SHAFT.x2 - 0.38;
+const LAD_Z = HOLE_S.z;
+const LAD_FACE = SHAFT.x2 - 0.06;
+
+// =====================================================================
+//  Textures procédurales
+// =====================================================================
+function makePlankTexture(vertical, seed) {
+  const S = 512, c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d'), rng = mulberry32(seed);
+  if (!vertical) { g.translate(S / 2, S / 2); g.rotate(-Math.PI / 2); g.translate(-S / 2, -S / 2); }
+  const n = 6, pw = S / n;
+  for (let i = 0; i < n; i++) {
+    const x0 = i * pw;
+    g.fillStyle = `hsl(${22 + rng() * 10},${24 + rng() * 14}%,${22 + rng() * 14}%)`;
+    g.fillRect(x0, 0, pw, S);
+    for (let k = 0; k < 26; k++) {
+      const gx = x0 + 4 + rng() * (pw - 8), a = 0.08 + rng() * 0.18;
+      g.strokeStyle = rng() > 0.5 ? `rgba(15,8,3,${a})` : `rgba(215,175,125,${a * 0.6})`;
+      g.lineWidth = 0.6 + rng() * 1.4;
+      g.beginPath(); g.moveTo(gx, 0);
+      for (let y = 32; y <= S; y += 32) g.lineTo(gx + Math.sin(y * 0.03 + k) * 2.2, y);
+      g.stroke();
+    }
+    g.fillStyle = 'rgba(8,5,2,0.9)'; g.fillRect(x0 - 1.5, 0, 3, S);
+    g.fillStyle = 'rgba(70,55,45,0.95)';
+    for (const ny of [14, S - 14]) { g.beginPath(); g.arc(x0 + pw / 2, ny, 2.4, 0, 7); g.fill(); }
+  }
+  g.fillStyle = 'rgba(8,5,2,0.9)'; g.fillRect(S - 1.5, 0, 1.5, S);
+  for (let i = 0; i < 10; i++) {
+    g.fillStyle = `rgba(0,0,0,${0.03 + rng() * 0.05})`;
+    g.beginPath(); g.ellipse(rng() * S, rng() * S, 30 + rng() * 60, 20 + rng() * 40, rng() * 3, 0, 7); g.fill();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4;
+  return t;
+}
+
+function makeBarrelTexture(seed) {            // 16 douelles verticales (une par 1/16 de tour)
+  const c = document.createElement('canvas'); c.width = 512; c.height = 256;
+  const g = c.getContext('2d'), rng = mulberry32(seed), n = 16, w = 512 / n;
+  for (let i = 0; i < n; i++) {
+    g.fillStyle = `hsl(${24 + rng() * 8},${40 + rng() * 12}%,${30 + rng() * 12}%)`;
+    g.fillRect(i * w, 0, w, 256);
+    for (let k = 0; k < 14; k++) {
+      g.strokeStyle = `rgba(${rng() > 0.5 ? '25,12,4' : '220,180,130'},${0.08 + rng() * 0.15})`;
+      g.lineWidth = 0.6 + rng() * 1.2;
+      const x = i * w + 2 + rng() * (w - 4);
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x + (rng() - 0.5) * 4, 256); g.stroke();
+    }
+    g.fillStyle = 'rgba(10,5,2,0.85)'; g.fillRect(i * w - 1, 0, 2, 256);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4;
+  return t;
+}
+
+// =====================================================================
+//  Monde 1 : la salle
+// =====================================================================
+function makeFloorTexture(repX, repY) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#3a3f4a'; g.fillRect(0, 0, 256, 256);
+  g.fillStyle = '#434957';
+  g.fillRect(0, 0, 128, 128); g.fillRect(128, 128, 128, 128);
+  g.strokeStyle = '#2b2f37'; g.lineWidth = 3; g.strokeRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(repX, repY);
+  return t;
+}
+
+const wallMat    = mk(roomMats, { color: 0xc9ced8, roughness: 1, side: THREE.DoubleSide });
+const wallBoxMat = mk(roomMats, { color: 0xc9ced8, roughness: 1 });
+const ceilMat    = mk(roomMats, { color: 0xdfe3ea, roughness: 1 });
+const floorMat   = mk(roomMats, { map: makeFloorTexture(ROOM_W / 2, ROOM_D / 2), roughness: 0.9 });
+
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_W, ROOM_D), floorMat);
+floor.rotation.x = -Math.PI / 2;
+roomRoot.add(floor);
+
+const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_W, ROOM_D), ceilMat);
+ceiling.rotation.x = Math.PI / 2;
+ceiling.position.y = ROOM_H;
+roomRoot.add(ceiling);
+
+function addPlaneWall(mat, w, h, x, y, z, rotY) {
+  const wall = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  wall.position.set(x, y, z); wall.rotation.y = rotY;
+  roomRoot.add(wall);
+}
+addPlaneWall(wallMat, ROOM_W, ROOM_H, 0, ROOM_H / 2,  ROOM_D / 2, Math.PI);
+addPlaneWall(wallMat, ROOM_D, ROOM_H, -ROOM_W / 2, ROOM_H / 2, 0,  Math.PI / 2);
+addPlaneWall(wallMat, ROOM_D, ROOM_H,  ROOM_W / 2, ROOM_H / 2, 0, -Math.PI / 2);
+
+function addBox(root, mat, w, h, d, x, y, z) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z); root.add(m); return m;
+}
+const bx1 = -ROOM_W / 2 - WALL_T, bx2 = ROOM_W / 2 + WALL_T;
+const wx1 = OPEN_X1 - JAMB, wx2 = OPEN_X2 + JAMB;
+addBox(roomRoot, wallBoxMat, wx1 - bx1, ROOM_H, WALL_T, (bx1 + wx1) / 2, ROOM_H / 2, WALL_Z);
+addBox(roomRoot, wallBoxMat, bx2 - wx2, ROOM_H, WALL_T, (wx2 + bx2) / 2, ROOM_H / 2, WALL_Z);
+addBox(roomRoot, wallBoxMat, wx2 - wx1, ROOM_H - OPEN_H - JAMB, WALL_T, DOOR_CX, (OPEN_H + JAMB + ROOM_H) / 2, WALL_Z);
+
+roomRoot.add(new THREE.AmbientLight(0xffffff, 0.45));
+const lamp = new THREE.PointLight(0xffffff, 0.9, 30);
+lamp.position.set(0, ROOM_H - 0.4, 0);
+roomRoot.add(lamp);
+
+// =====================================================================
+//  Monde 2 : l'extérieur (tore d'herbe et de collines)
+// =====================================================================
+const DOOR_CZ = WALL_Z;
+const wrapP = (a) => a - P * Math.round(a / P);
+const TERRAIN_DROP = 0.01;
+
+function hLocal(x, z) {
+  const u = x * 2 * Math.PI / P, v = z * 2 * Math.PI / P;
+  const h = 2.8 * Math.sin(u + 0.6) * Math.cos(v - 0.3)
+          + 1.4 * Math.sin(2 * u + v + 2.1) * Math.cos(2 * v + 0.5)
+          + 0.4 * Math.sin(3 * u + 2 * v);
+  const t = Math.min(1, Math.max(0, (Math.hypot(x, z) - 5) / 11));
+  return h * t * t * (3 - 2 * t);
+}
+const hWorld = (x, z) => hLocal(wrapP(x - DOOR_CX), wrapP(z - DOOR_CZ));
+
+function buildTerrainGeometry() {
+  const SEG = 120;
+  const g = new THREE.PlaneGeometry(P, P, SEG, SEG);
+  g.rotateX(-Math.PI / 2);
+  const pos = g.attributes.position, n = pos.count;
+  const normals = new Float32Array(n * 3), colors = new Float32Array(n * 3);
+  const e = 0.3;
+  for (let i = 0; i < n; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    pos.setY(i, hLocal(x, z) - TERRAIN_DROP);
+    const dhx = (hLocal(x + e, z) - hLocal(x - e, z)) / (2 * e);
+    const dhz = (hLocal(x, z + e) - hLocal(x, z - e)) / (2 * e);
+    const l = Math.hypot(dhx, 1, dhz);
+    normals[i * 3] = -dhx / l; normals[i * 3 + 1] = 1 / l; normals[i * 3 + 2] = -dhz / l;
+    const u = x * 2 * Math.PI / P, v = z * 2 * Math.PI / P;
+    const t = 0.5 + 0.25 * Math.sin(5 * u + 1) * Math.sin(4 * v + 2) + 0.25 * Math.sin(9 * u + 7 * v);
+    colors[i * 3] = 0.17 + 0.15 * t; colors[i * 3 + 1] = 0.34 + 0.18 * t; colors[i * 3 + 2] = 0.10 + 0.08 * t;
+  }
+  g.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return g;
+}
+
+function makeGrassTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = '#e6e6e6'; g.fillRect(0, 0, 128, 128);
+  for (let i = 0; i < 1800; i++) {
+    const v = 170 + Math.random() * 85;
+    g.fillStyle = `rgb(${v},${v},${v})`;
+    g.fillRect(Math.random() * 128, Math.random() * 128, 1 + Math.random() * 2, 1 + Math.random() * 2);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(P / 4, P / 4);
+  return t;
+}
+
+outScene.fog = new THREE.Fog(FOG_COLOR, 25, 95);
+doorScene.fog = outScene.fog;
+
+const groundMat = mk(outMats, { vertexColors: true, map: makeGrassTexture(), roughness: 1 });
+const tuftMat   = mk(outMats, { vertexColors: true, roughness: 1, side: THREE.DoubleSide });
+
+const SUN_DIR = new THREE.Vector3(0.45, 0.6, -0.5).normalize();
+const skyMat = mk(outMats, {
+  uniforms: { sunDir: { value: SUN_DIR } },
+  side: THREE.BackSide, depthWrite: false,
+  vertexShader: `varying vec3 vDir;
+    void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `varying vec3 vDir; uniform vec3 sunDir;
+    void main(){
+      float h = clamp(vDir.y, 0.0, 1.0);
+      vec3 c = mix(vec3(0.75, 0.86, 0.96), vec3(0.22, 0.48, 0.90), pow(h, 0.5));
+      float s = max(dot(normalize(vDir), sunDir), 0.0);
+      c += vec3(1.0, 0.92, 0.75) * (pow(s, 800.0) * 2.0 + pow(s, 10.0) * 0.2);
+      gl_FragColor = vec4(c, 1.0);
+    }`
+}, THREE.ShaderMaterial);
+const sky = new THREE.Mesh(new THREE.SphereGeometry(300, 32, 16), skyMat);
+sky.frustumCulled = false;
+sky.renderOrder = -10;
+outScene.add(sky);
+
+outScene.add(new THREE.HemisphereLight(0xcfe6ff, 0x4a6a35, 0.75));
+const sun = new THREE.DirectionalLight(0xfff1d6, 0.9);
+sun.position.copy(SUN_DIR).multiplyScalar(100);
+outScene.add(sun);
+
+function makeTuftGeometry() {
+  const pos = [], col = [], nor = [];
+  const H = 0.55, W = 0.07;
+  for (let k = 0; k < 3; k++) {
+    const a = k * Math.PI / 3, cx = Math.cos(a), sz = Math.sin(a), lean = 0.1;
+    pos.push(-W * cx, 0, -W * sz,  W * cx, 0, W * sz,  lean * sz, H, -lean * cx);
+    col.push(0.10, 0.22, 0.06,  0.10, 0.22, 0.06,  0.50, 0.70, 0.28);
+    nor.push(0, 1, 0,  0, 1, 0,  0, 1, 0);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  return g;
+}
+const TUFTS = 48000;
+const tuftMatrices = new Float32Array(TUFTS * 16);
+{
+  const rng = mulberry32(1234), d = new THREE.Object3D();
+  let n = 0;
+  while (n < TUFTS) {
+    const x = (rng() - 0.5) * P, z = (rng() - 0.5) * P;
+    if (Math.hypot(x, z) < 2.5) continue;
+    d.position.set(x, hLocal(x, z) - TERRAIN_DROP - 0.02, z);
+    d.rotation.y = rng() * Math.PI * 2;
+    const s = 0.7 + rng() * 0.9;
+    d.scale.set(s, s * (0.8 + rng() * 0.6), s);
+    d.updateMatrix();
+    d.matrix.toArray(tuftMatrices, n * 16);
+    n++;
+  }
+}
+const terrainGeo = buildTerrainGeometry();
+const tuftGeo = makeTuftGeometry();
+
+const terrainTiles = [], grassTiles = [], doorCopies = [];
+for (let ix = -2; ix <= 2; ix++) {
+  for (let iz = -2; iz <= 2; iz++) {
+    const ox = ix * P, oz = iz * P;
+    const terrain = new THREE.Mesh(terrainGeo, groundMat);
+    terrain.position.set(DOOR_CX + ox, 0, DOOR_CZ + oz);
+    outScene.add(terrain);
+    terrainTiles.push({ mesh: terrain, cx: DOOR_CX + ox, cz: DOOR_CZ + oz });
+    if (Math.abs(ix) <= 1 && Math.abs(iz) <= 1) {
+      const grass = new THREE.InstancedMesh(tuftGeo, tuftMat, TUFTS);
+      grass.instanceMatrix.array.set(tuftMatrices);
+      grass.instanceMatrix.needsUpdate = true;
+      grass.frustumCulled = false;
+      grass.position.set(DOOR_CX + ox, 0, DOOR_CZ + oz);
+      outScene.add(grass);
+      grassTiles.push({ mesh: grass, cx: DOOR_CX + ox, cz: DOOR_CZ + oz });
+      doorCopies.push({ ox, oz });
+    }
+  }
+}
+const camPos = new THREE.Vector3();
+function updateTiles(p) {
+  const R = P / 2 + 100;
+  for (const t of terrainTiles) t.mesh.visible = Math.abs(p.x - t.cx) < R && Math.abs(p.z - t.cz) < R;
+  for (const t of grassTiles)   t.mesh.visible = Math.abs(p.x - t.cx) < R && Math.abs(p.z - t.cz) < R;
+}
+
+// =====================================================================
+//  La porte : un seul objet partagé par la salle et l'extérieur
+// =====================================================================
+const DOOR = {
+  length: 1.08, height: 2.15, thickness: 0.042, bottom: 0.02,
+  mass: 25, hingeX: OPEN_X1 + 0.01, hingeZ: WALL_Z,
+  limit: 1.9, damping: 1.2, friction: 0.3, restitution: 0.1, stopBounce: 0.25, selfClose: 0, maxSpeed: 8,
+};
+
+const doorAmb = new THREE.AmbientLight(0xffffff, 0.5);
+const doorDir = new THREE.DirectionalLight(0xffffff, 0.6);
+doorScene.add(doorAmb, doorDir);
+const LOOK_ROOM = { amb: new THREE.Color(0xffffff), ambI: 0.5, dir: new THREE.Color(0xffe6c8), dirI: 0.6,  pos: new THREE.Vector3(-0.3, 0.5, 0.8) };
+const LOOK_OUT  = { amb: new THREE.Color(0xd4e8ff), ambI: 0.6, dir: new THREE.Color(0xfff1d6), dirI: 0.95, pos: SUN_DIR.clone() };
+let doorLookMix = 0;
+function applyDoorLook() {
+  const m = doorLookMix;
+  doorAmb.color.copy(LOOK_ROOM.amb).lerp(LOOK_OUT.amb, m);
+  doorAmb.intensity = lerp(LOOK_ROOM.ambI, LOOK_OUT.ambI, m);
+  doorDir.color.copy(LOOK_ROOM.dir).lerp(LOOK_OUT.dir, m);
+  doorDir.intensity = lerp(LOOK_ROOM.dirI, LOOK_OUT.dirI, m);
+  doorDir.position.copy(LOOK_ROOM.pos).lerp(LOOK_OUT.pos, m);
+}
+applyDoorLook();
+
+function makeWoodTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = '#9a6633'; g.fillRect(0, 0, 256, 512);
+  for (let i = 0; i < 150; i++) {
+    const x = Math.random() * 256, w = 1 + Math.random() * 3, l = 38 + Math.random() * 24;
+    g.fillStyle = `hsla(26, 45%, ${l}%, ${0.10 + Math.random() * 0.2})`;
+    g.fillRect(x, 0, w, 512);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.anisotropy = 4;
+  return t;
+}
+const woodTex   = makeWoodTexture();
+const leafMat   = new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.65 });
+const panelMat  = new THREE.MeshStandardMaterial({ map: woodTex, color: 0xd8c3a2, roughness: 0.6 });
+const jambMat   = new THREE.MeshStandardMaterial({ color: 0x5a3b24, roughness: 0.7 });
+const casingMat = new THREE.MeshStandardMaterial({ color: 0x6b4730, roughness: 0.65 });
+const sillMat   = new THREE.MeshStandardMaterial({ color: 0x6e6a64, roughness: 0.9 });
+const metalMat  = new THREE.MeshStandardMaterial({ color: 0xd4af37, roughness: 0.35, metalness: 0.35 });
+
+const addDoorBox = (mat, w, h, d, x, y, z) => addBox(doorRoot, mat, w, h, d, x, y, z);
+addDoorBox(jambMat, JAMB, OPEN_H, WALL_T, OPEN_X1 - JAMB / 2, OPEN_H / 2, WALL_Z);
+addDoorBox(jambMat, JAMB, OPEN_H, WALL_T, OPEN_X2 + JAMB / 2, OPEN_H / 2, WALL_Z);
+addDoorBox(jambMat, OPEN_X2 - OPEN_X1 + 2 * JAMB, JAMB, WALL_T, DOOR_CX, OPEN_H + JAMB / 2, WALL_Z);
+for (const s of [1, -1]) {
+  const cz = WALL_Z + s * (WALL_T / 2 + CASING_T / 2);
+  addDoorBox(casingMat, CASING_W, OPEN_H, CASING_T, OPEN_X1 - CASING_W / 2, OPEN_H / 2, cz);
+  addDoorBox(casingMat, CASING_W, OPEN_H, CASING_T, OPEN_X2 + CASING_W / 2, OPEN_H / 2, cz);
+  addDoorBox(casingMat, OPEN_X2 - OPEN_X1 + 2 * CASING_W, CASING_W, CASING_T, DOOR_CX, OPEN_H + CASING_W / 2, cz);
+}
+addDoorBox(sillMat, OPEN_X2 - OPEN_X1, 0.012, WALL_T, DOOR_CX, 0.006, WALL_Z);
+
+function makeLeaf() {
+  const pivot = new THREE.Group();
+  const L = DOOR.length, H = DOOR.height, T = DOOR.thickness, y0 = DOOR.bottom;
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(L, H, T), leafMat);
+  slab.position.set(L / 2, y0 + H / 2, 0);
+  pivot.add(slab);
+  const stile = 0.14, mid = 0.10, pw = (L - 2 * stile - mid) / 2;
+  const rows = [{ y: 0.24, h: 0.77 }, { y: 1.15, h: 0.85 }];
+  const panelGeos = rows.map(r => new THREE.BoxGeometry(pw, r.h, 0.012));
+  for (const side of [1, -1]) for (let col = 0; col < 2; col++) rows.forEach((r, i) => {
+    const p = new THREE.Mesh(panelGeos[i], panelMat);
+    p.position.set(stile + pw / 2 + col * (pw + mid), y0 + r.y + r.h / 2, side * (T / 2 + 0.002));
+    pivot.add(p);
+  });
+  const roseGeo  = new THREE.CylinderGeometry(0.026, 0.026, 0.01, 20);    roseGeo.rotateX(Math.PI / 2);
+  const neckGeo  = new THREE.CylinderGeometry(0.008, 0.008, 0.045, 12);   neckGeo.rotateX(Math.PI / 2);
+  const leverGeo = new THREE.CylinderGeometry(0.0085, 0.0085, 0.115, 12); leverGeo.rotateZ(Math.PI / 2);
+  const capGeo   = new THREE.SphereGeometry(0.0085, 12, 8);
+  const hx = L - 0.075, hy = y0 + 1.08;
+  for (const s of [1, -1]) {
+    const add = (geo, x, z) => { const m = new THREE.Mesh(geo, metalMat); m.position.set(x, hy, z); pivot.add(m); };
+    add(roseGeo, hx, s * (T / 2 + 0.005)); add(neckGeo, hx, s * (T / 2 + 0.0325));
+    add(leverGeo, hx - 0.0575, s * (T / 2 + 0.055)); add(capGeo, hx - 0.115, s * (T / 2 + 0.055));
+  }
+  const plateGeo = new THREE.BoxGeometry(0.04, 0.1, 0.004);
+  for (const y of [0.22, 1.08, 1.96]) for (const s of [1, -1]) {
+    const pl = new THREE.Mesh(plateGeo, metalMat); pl.position.set(0.03, y, s * (T / 2 + 0.002)); pivot.add(pl);
+  }
+  return pivot;
+}
+const leafPivot = makeLeaf();
+leafPivot.position.set(DOOR.hingeX, 0, DOOR.hingeZ);
+doorRoot.add(leafPivot);
+for (const y of [0.22, 1.08, 1.96]) {
+  const k = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.011, 0.1, 12), metalMat);
+  k.position.set(DOOR.hingeX, y, DOOR.hingeZ);
+  doorRoot.add(k);
+}
+
+// =====================================================================
+//  Monde 3 : la cabane vide (l'intérieur du tonneau, « plus grand dedans que dehors »)
+// =====================================================================
+shedScene.fog = new THREE.Fog(0x120d08, 4, 18);
+shedScene.add(new THREE.AmbientLight(0x6b5744, 0.8));
+
+const wallTex  = makePlankTexture(true, 11);
+const floorTex = makePlankTexture(false, 23);
+const shedWallMat  = mk(shedMats, { map: wallTex,  color: 0xd2bca0, roughness: 1, side: THREE.DoubleSide });
+const shedFloorMat = mk(shedMats, { map: floorTex, color: 0xb8a58c, roughness: 0.95, side: THREE.DoubleSide });
+const shedCeilMat  = mk(shedMats, { map: wallTex,  color: 0x8f7b66, roughness: 1, side: THREE.DoubleSide });
+const shedDoorMat  = mk(shedMats, { map: wallTex,  color: 0xa68c70, roughness: 1, side: THREE.DoubleSide });
+const shedLinMat   = mk(shedMats, { map: wallTex,  color: 0x4a3626, roughness: 1, side: THREE.DoubleSide });   // fond du tonneau, vu d'en dessous
+const mBeam   = mk(shedMats, { color: 0x3a281a, roughness: 1 });
+const mDark   = mk(shedMats, { color: 0x2b2118, roughness: 0.9 });
+const mMetal  = mk(shedMats, { color: 0x6c7075, roughness: 0.45, metalness: 0.7 });
+const mWood   = mk(shedMats, { map: wallTex, color: 0xb59a7e, roughness: 1 });
+const mLadder = mk(shedMats, { color: 0x6b4a2b, roughness: 0.9 });
+const mGlow   = mk(shedMats, { color: 0xffc874 }, THREE.MeshBasicMaterial);
+const mLeak   = mk(shedMats, { color: 0xfff1cf }, THREE.MeshBasicMaterial);
+const mWindow = mk(shedMats, { color: 0xc4dcf5, side: THREE.DoubleSide }, THREE.MeshBasicMaterial);
+
+function scaleUV(geo, su, sv) {
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * su, uv.getY(i) * sv);
+  return geo;
+}
+function sWall(w, h, x, y, z, ry) {
+  const m = new THREE.Mesh(scaleUV(new THREE.PlaneGeometry(w, h), w / 1.2, h / 1.2), shedWallMat);
+  m.position.set(x, y, z); m.rotation.y = ry; shedScene.add(m); return m;
+}
+function sFlat(mat, w, d, x, y, z, down) {
+  const m = new THREE.Mesh(scaleUV(new THREE.PlaneGeometry(w, d), w / 1.2, d / 1.2), mat);
+  m.rotation.x = down ? Math.PI / 2 : -Math.PI / 2;
+  m.position.set(x, y, z); shedScene.add(m); return m;
+}
+const sBox = (mat, w, h, d, x, y, z) => addBox(shedScene, mat, w, h, d, x, y, z);
+function sCyl(mat, rt, rb, h, x, y, z, seg = 14) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat);
+  m.position.set(x, y, z); shedScene.add(m); return m;
+}
+
+const SX1 = SHED.x1, SX2 = SHED.x2, SZ1 = SHED.z1, SZ2 = SHED.z2, SH = SHED.h;
+sFlat(shedFloorMat, SX2 - SX1, SZ2 - SZ1, 0, 0, 0, false);
+sFlat(shedCeilMat, SHAFT.x1 - SX1, SZ2 - SZ1, (SX1 + SHAFT.x1) / 2, SH, 0, true);
+sFlat(shedCeilMat, SX2 - SHAFT.x1, SZ2 - SHAFT.z2, (SHAFT.x1 + SX2) / 2, SH, (SHAFT.z2 + SZ2) / 2, true);   // la trappe du puits reste libre
+sWall(SX2 - SX1, SH, 0, SH / 2, SZ1, 0);
+sWall(SX2 - SX1, SH, 0, SH / 2, SZ2, Math.PI);
+sWall(SZ2 - SZ1, SH, SX1, SH / 2, 0, Math.PI / 2);
+sWall(SZ2 - SZ1, SH, SX2, SH / 2, 0, -Math.PI / 2);
+
+{   // puits de l'échelle, du plafond jusqu'au fond du tonneau
+  const SW = SHAFT.x2 - SHAFT.x1, SHH = SHAFT.top - SH, SY = (SH + SHAFT.top) / 2;
+  const cx = (SHAFT.x1 + SHAFT.x2) / 2, cz = (SHAFT.z1 + SHAFT.z2) / 2;
+  sWall(SW, SHH, SHAFT.x2, SY, cz, -Math.PI / 2);
+  sWall(SW, SHH, cx, SY, SHAFT.z1, 0);
+  sWall(SW, SHH, SHAFT.x1, SY, cz, Math.PI / 2);
+  sWall(SW, SHH, cx, SY, SHAFT.z2, Math.PI);
+  const lin = new THREE.Shape();
+  lin.moveTo(SHAFT.x1, SHAFT.z1); lin.lineTo(SHAFT.x2, SHAFT.z1); lin.lineTo(SHAFT.x2, SHAFT.z2); lin.lineTo(SHAFT.x1, SHAFT.z2); lin.closePath();
+  const linHole = new THREE.Path();
+  linHole.absarc(HOLE_S.x, HOLE_S.z, HR, 0, Math.PI * 2, true);
+  lin.holes.push(linHole);
+  const linGeo = new THREE.ShapeGeometry(lin, 48);
+  linGeo.rotateX(Math.PI / 2);
+  const linMesh = new THREE.Mesh(linGeo, shedLinMat);
+  linMesh.position.y = SHAFT.top + 0.002;
+  shedScene.add(linMesh);
+}
+
+// Charpente
+for (const z of [-0.3, 0.6, 1.45]) sBox(mBeam, SX2 - SX1, 0.14, 0.12, 0, SH - 0.07, z);
+sBox(mBeam, SHAFT.x1 - SX1, 0.14, 0.12, (SX1 + SHAFT.x1) / 2, SH - 0.07, -1.2);
+for (const [x, z] of [[SX1 + 0.06, SZ1 + 0.06], [SX1 + 0.06, SZ2 - 0.06], [SX2 - 0.06, SZ2 - 0.06]]) sBox(mBeam, 0.12, SH, 0.12, x, SH / 2, z);
+
+// Échelle, le long du mur droit, du sol jusqu'en haut du puits
+{
+  const railH = 5.5;
+  for (const dz of [-0.2, 0.2]) sBox(mLadder, 0.05, railH, 0.05, LAD_FACE, 0.05 + railH / 2, LAD_Z + dz);
+  const rungGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.4, 8); rungGeo.rotateX(Math.PI / 2);
+  for (let y = 0.25; y < 5.55; y += 0.3) { const r = new THREE.Mesh(rungGeo, mLadder); r.position.set(LAD_FACE, y, LAD_Z); shedScene.add(r); }
+  for (const y of [0.5, 1.9, 3.3, 4.7]) for (const dz of [-0.2, 0.2]) sBox(mMetal, 0.04, 0.04, 0.05, SHAFT.x2 - 0.017, y, LAD_Z + dz);
+}
+
+// Porte de la cabane (fermée), avec de la lumière qui filtre par les jointures
+{
+  const dx = -0.9;
+  const door = new THREE.Mesh(scaleUV(new THREE.PlaneGeometry(1.0, 2.0), 1 / 1.2, 2 / 1.2), shedDoorMat);
+  door.position.set(dx, 1.0, SZ2 - 0.012); door.rotation.y = Math.PI; shedScene.add(door);
+  for (const s of [-1, 1]) sBox(mBeam, 0.09, 2.05, 0.05, dx + s * 0.545, 1.025, SZ2 - 0.03);
+  sBox(mBeam, 1.18, 0.09, 0.05, dx, 2.045, SZ2 - 0.03);
+  sBox(mBeam, 0.85, 0.09, 0.03, dx, 1.75, SZ2 - 0.035);
+  sBox(mBeam, 0.85, 0.09, 0.03, dx, 0.35, SZ2 - 0.035);
+  sBox(mBeam, 1.64, 0.09, 0.03, dx, 1.05, SZ2 - 0.035).rotation.z = Math.atan2(1.4, 0.85);
+  sBox(mMetal, 0.5, 0.04, 0.02, dx, 1.0, SZ2 - 0.055);
+  sBox(mMetal, 0.03, 0.12, 0.02, dx + 0.35, 1.0, SZ2 - 0.055);
+  for (const s of [-1, 1]) sBox(mLeak, 0.012, 2.0, 0.01, dx + s * 0.506, 1.0, SZ2 - 0.02);
+  sBox(mLeak, 1.0, 0.012, 0.01, dx, 0.006, SZ2 - 0.02);
+}
+
+// Fenêtre sale
+{
+  const wx = 1.45, wy = 1.55;
+  const pane = new THREE.Mesh(new THREE.PlaneGeometry(0.7, 0.55), mWindow);
+  pane.position.set(wx, wy, SZ2 - 0.012); shedScene.add(pane);
+  for (const s of [-1, 1]) { sBox(mBeam, 0.78, 0.05, 0.05, wx, wy + s * 0.3, SZ2 - 0.03); sBox(mBeam, 0.05, 0.65, 0.05, wx + s * 0.375, wy, SZ2 - 0.03); }
+  sBox(mBeam, 0.7, 0.03, 0.03, wx, wy, SZ2 - 0.03);
+  sBox(mBeam, 0.03, 0.55, 0.03, wx, wy, SZ2 - 0.03);
+  sBox(mWood, 0.9, 0.04, 0.12, wx, wy - 0.33, SZ2 - 0.07);
+}
+
+// Lanterne suspendue + éclairage
+const LANT = new THREE.Vector3(0, 2.0, 0.2);
+sCyl(mDark, 0.005, 0.005, 0.5, LANT.x, SH - 0.25, LANT.z, 6);
+sCyl(mDark, 0.07, 0.08, 0.03, LANT.x, 2.08, LANT.z);
+sCyl(mGlow, 0.055, 0.06, 0.15, LANT.x, 2.17, LANT.z);
+sCyl(mDark, 0.02, 0.08, 0.05, LANT.x, 2.28, LANT.z);
+const lanternLight = new THREE.PointLight(0xffb15c, 1.1, 12, 1.3);
+lanternLight.position.set(LANT.x, 2.15, LANT.z);
+shedScene.add(lanternLight);
+const shaftLight = new THREE.PointLight(0xffb870, 0.7, 6, 1.2);
+shaftLight.position.set(HOLE_S.x - 0.3, 3.4, HOLE_S.z);
+shedScene.add(shaftLight);
+const windowLight = new THREE.PointLight(0xb7d4ff, 0.5, 5, 1.2);
+windowLight.position.set(1.45, 1.5, SZ2 - 0.5);
+shedScene.add(windowLight);
+
+// =====================================================================
+//  Le tonneau : posé dans la salle, on peut le porter, retirer son couvercle, entrer dedans
+// =====================================================================
+const barrelTex = makeBarrelTexture(7);
+function makeBarrelMats(list) {
+  return {
+    wood:  mk(list, { map: barrelTex, color: 0xd8bfa0, roughness: 0.9, side: THREE.DoubleSide }),
+    lidW:  mk(list, { map: barrelTex, color: 0xc4aa8a, roughness: 0.9 }),
+    metal: mk(list, { color: 0x3b3d42, roughness: 0.5, metalness: 0.7 }),
+  };
+}
+const rOut = (t) => B_TOP + (BR - B_TOP) * (1 - (2 * t - 1) * (2 * t - 1));   // profil bombé
+
+const BG = (() => {
+  const pts = [new THREE.Vector2(0, 0)];                                       // fond
+  for (let i = 0; i <= 16; i++) { const t = i / 16; pts.push(new THREE.Vector2(rOut(t), t * BH)); }   // paroi extérieure
+  pts.push(new THREE.Vector2(HR, BH));                                         // bordure
+  for (let i = 1; i <= 12; i++) { const y = BH - (BH - 0.05) * i / 12; pts.push(new THREE.Vector2(rOut(y / BH) - 0.08, y)); }   // paroi intérieure
+  pts.push(new THREE.Vector2(0, 0.05));
+  const body = new THREE.LatheGeometry(pts, 40);
+  const hoops = [0.12, 0.3, 0.6, 0.78].map(y => {
+    const g = new THREE.TorusGeometry(rOut(y / BH) + 0.004, 0.013, 8, 48);
+    g.rotateX(Math.PI / 2); g.translate(0, y, 0); return g;
+  });
+  const lid = new THREE.CylinderGeometry(LID_R, LID_R, LID_T, 40); lid.translate(0, LID_T / 2, 0);
+  const ring = new THREE.TorusGeometry(0.06, 0.01, 8, 20); ring.rotateX(Math.PI / 2); ring.translate(0, LID_T + 0.01, 0);
+  const band = new THREE.BoxGeometry(2 * LID_R - 0.04, 0.008, 0.05); band.translate(0, LID_T + 0.004, 0);
+  return { body, hoops, lid, ring, band };
+})();
+
+function buildBarrel(M) {
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(BG.body, M.wood));
+  for (const h of BG.hoops) g.add(new THREE.Mesh(h, M.metal));
+  const lg = new THREE.Group();                                  // couvercle : son origine est sa face inférieure
+  lg.add(new THREE.Mesh(BG.lid, M.lidW), new THREE.Mesh(BG.ring, M.metal), new THREE.Mesh(BG.band, M.metal));
+  lg.position.y = BH;
+  g.add(lg);
+  return { group: g, lid: lg };
+}
+
+// État du tonneau et du couvercle
+const bp  = { state: 'placed', world: 'room', x: -2.2, y: 0, z: -3.2, yaw: 0.5 };   // state : 'placed' | 'carried'
+const lid = { mode: 'on', x: 0, y: BH, z: 0, dx: 0, dz: 0, fx: 0, fy: 0, fz: 0, tx: 0, ty: 0, tz: 0, t: 0, tilt: 0, ax: 1, az: 0 };
+// mode : 'on' (fermé) | 'drag' (suit la souris) | 'fall' (tombe au sol) | 'off' (posé au sol) | 'back' (revient)
+const lidOn = () => lid.mode === 'on' || lid.mode === 'drag' || lid.mode === 'back';
+
+// Instances : une dans la salle, neuf dans l'extérieur (une par tuile du tore), une dans les mains
+const matsRoom = makeBarrelMats(roomMats), matsOut = makeBarrelMats(outMats), matsHold = makeBarrelMats([]);
+const barrels = [];
+{
+  const b = buildBarrel(matsRoom); roomRoot.add(b.group);
+  barrels.push({ group: b.group, lid: b.lid, ox: 0, oz: 0, w: 'room' });
+  for (let ix = -1; ix <= 1; ix++) for (let iz = -1; iz <= 1; iz++) {
+    const o = buildBarrel(matsOut); outScene.add(o.group);
+    barrels.push({ group: o.group, lid: o.lid, ox: ix * P, oz: iz * P, w: 'out' });
+  }
+}
+const held = buildBarrel(matsHold);
+const holder = new THREE.Group();
+holder.rotation.order = 'YXZ';
+holder.add(held.group);
+held.group.position.set(CARRY.x, CARRY.y, CARRY.z);
+held.group.rotation.set(-0.1, 0.25, 0.04);
+holdScene.add(holder);
+const holdLight = new THREE.HemisphereLight(0xffffff, 0x666a74, 1.0);
+holdScene.add(holdLight);
+
+const _lq = new THREE.Quaternion(), _ax = new THREE.Vector3();
+function updateLid(dt) {
+  if (lid.mode === 'drag') { lid.x = lid.dx; lid.z = lid.dz; lid.y = BH + 0.06; }
+  else if (lid.mode === 'fall' || lid.mode === 'back') {
+    const fall = lid.mode === 'fall';
+    lid.t = Math.min(1, lid.t + dt / (fall ? 0.4 : 0.3));
+    const k = fall ? lid.t * lid.t : ss(lid.t);
+    lid.x = lerp(lid.fx, lid.tx, k); lid.y = lerp(lid.fy, lid.ty, k); lid.z = lerp(lid.fz, lid.tz, k);
+    if (lid.t >= 1) lid.mode = fall ? 'off' : 'on';
+  }
+  const d = Math.hypot(lid.x, lid.z);
+  if (lid.mode === 'drag' && d > 1e-4) { lid.ax = lid.z / d; lid.az = -lid.x / d; }
+  const want = lid.mode === 'drag' ? Math.min(d, 0.8) * 0.3 : 0;
+  lid.tilt += (want - lid.tilt) * Math.min(1, dt * 12);
+}
+function updateBarrelVisuals(dt) {
+  updateLid(dt);
+  _ax.set(lid.ax, 0, lid.az);
+  _lq.setFromAxisAngle(_ax, lid.tilt);
+  const placed = bp.state === 'placed';
+  for (const b of barrels) {
+    b.group.visible = placed && bp.world === b.w;
+    b.group.position.set(bp.x + b.ox, bp.y, bp.z + b.oz);
+    b.group.rotation.y = bp.yaw;
+    b.lid.position.set(lid.x, lid.y, lid.z);
+    b.lid.quaternion.copy(_lq);
+  }
+  held.group.visible = bp.state === 'carried';
+}
+
+const _O = new THREE.Vector3();
+function holeCenter(ref) {          // centre de l'ouverture (copie de tuile la plus proche de ref, dans l'extérieur)
+  let ox = 0, oz = 0;
+  if (bp.world === 'out') { ox = P * Math.round((ref.x - bp.x) / P); oz = P * Math.round((ref.z - bp.z) / P); }
+  return _O.set(bp.x + ox, bp.y + BH, bp.z + oz);
+}
+const link = { O: new THREE.Vector3() };   // ouverture utilisée pour entrer (coordonnées du monde d'origine)
+
+// =====================================================================
+//  Portail de la porte : quad dans l'ouverture (stencil) + remise à zéro de la profondeur
+// =====================================================================
+const quadGeo = new THREE.PlaneGeometry(OPEN_X2 - OPEN_X1 + 0.04, OPEN_H + 0.07);
+quadGeo.translate(DOOR_CX, (OPEN_H - 0.03) / 2, WALL_Z);
+
+const stencilQuadMat = new THREE.MeshBasicMaterial({
+  colorWrite: false, depthWrite: false, side: THREE.DoubleSide,
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc, stencilRef: 1,
+  stencilZPass: THREE.ReplaceStencilOp, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp
+});
+const depthQuadMat = new THREE.ShaderMaterial({
+  vertexShader: `void main(){ gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); gl_Position.z = gl_Position.w; }`,
+  fragmentShader: `void main(){ gl_FragColor = vec4(0.0); }`,
+  colorWrite: false, depthWrite: true, depthFunc: THREE.AlwaysDepth, side: THREE.DoubleSide,
+  stencilWrite: true, stencilFunc: THREE.EqualStencilFunc, stencilRef: 1,
+  stencilZPass: THREE.KeepStencilOp, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp
+});
+const portalScene = new THREE.Scene();
+const quadStencil = new THREE.Mesh(quadGeo, stencilQuadMat);
+const quadDepth   = new THREE.Mesh(quadGeo, depthQuadMat);
+quadStencil.frustumCulled = quadDepth.frustumCulled = false;
+portalScene.add(quadStencil, quadDepth);
+
+function setStencil(list, ref) {
+  for (const m of list) {
+    if (ref === 0) { m.stencilWrite = false; continue; }
+    m.stencilWrite = true; m.stencilFunc = THREE.EqualStencilFunc; m.stencilRef = ref;
+    m.stencilFail = m.stencilZFail = m.stencilZPass = THREE.KeepStencilOp;
+  }
+}
+
+const planeOut  = new THREE.Plane(new THREE.Vector3(0, 0, -1), WALL_Z);
+const planeRoom = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+const frustum = new THREE.Frustum(), projScreen = new THREE.Matrix4(), tmpBox = new THREE.Box3();
+
+function portalVisible(ox, oz) {
+  tmpBox.min.set(OPEN_X1 - 0.1 + ox, -0.1, WALL_Z - 0.1 + oz);
+  tmpBox.max.set(OPEN_X2 + 0.1 + ox, OPEN_H + 0.1, WALL_Z + 0.1 + oz);
+  return frustum.intersectsBox(tmpBox);
+}
+function doorVisible(ox, oz) {
+  tmpBox.min.set(OPEN_X1 - 1.3 + ox, -0.1, WALL_Z - 1.3 + oz);
+  tmpBox.max.set(OPEN_X2 + 1.3 + ox, 2.5, WALL_Z + 1.3 + oz);
+  return frustum.intersectsBox(tmpBox);
+}
+
+function drawPortal(k, ox, oz, target) {
+  quadStencil.position.set(ox, 0, oz); quadDepth.position.set(ox, 0, oz);
+  stencilQuadMat.stencilRef = k; depthQuadMat.stencilRef = k;
+  quadStencil.visible = true;  quadDepth.visible = false;
+  renderer.render(portalScene, camera);
+  quadStencil.visible = false; quadDepth.visible = true;
+  renderer.render(portalScene, camera);
+  if (target === 'out') {
+    setStencil(outMats, k);
+    renderer.clippingPlanes = [planeOut];
+    renderer.render(outScene, camera);
+    setStencil(outMats, 0);
+  } else {
+    roomRoot.position.set(ox, 0, oz);
+    planeRoom.constant = -(WALL_Z + oz);
+    setStencil(roomMats, k);
+    renderer.clippingPlanes = [planeRoom];
+    renderer.render(roomScene, camera);
+    setStencil(roomMats, 0);
+    roomRoot.position.set(0, 0, 0);
+  }
+  renderer.clippingPlanes = [];
+}
+
+function drawOutPortals(skipMain) {
+  const list = [];
+  for (const d of doorCopies) {
+    if (skipMain && d.ox === 0 && d.oz === 0) continue;
+    if (camPos.z >= WALL_Z + d.oz) continue;
+    if (!portalVisible(d.ox, d.oz)) continue;
+    const dist = Math.hypot(camPos.x - (DOOR_CX + d.ox), camPos.z - (WALL_Z + d.oz));
+    if (dist > 110) continue;
+    list.push({ ...d, dist });
+  }
+  list.sort((a, b) => a.dist - b.dist);
+  list.forEach((d, i) => drawPortal(i + 1, d.ox, d.oz, 'room'));
+}
+
+const TUNNEL_HALF = 0.08;
+function renderTunnel() {
+  roomRoot.position.set(0, 0, 0);
+  setStencil(roomMats, 0); setStencil(outMats, 0);
+  planeRoom.constant = -WALL_Z;
+  renderer.clippingPlanes = [planeRoom];
+  renderer.render(roomScene, camera);
+  renderer.clippingPlanes = [planeOut];
+  renderer.render(outScene, camera);
+  renderer.clippingPlanes = [];
+}
+
+function renderDoors() {
+  renderer.clippingPlanes = [];
+  for (const d of doorCopies) {
+    if (!doorVisible(d.ox, d.oz)) continue;
+    if (Math.hypot(camPos.x - (DOOR_CX + d.ox), camPos.z - (WALL_Z + d.oz)) > 115) continue;
+    doorRoot.position.set(d.ox, 0, d.oz);
+    renderer.render(doorScene, camera);
+  }
+  doorRoot.position.set(0, 0, 0);
+}
+
+// =====================================================================
+//  Portail du tonneau : ouverture circulaire horizontale reliant le tonneau au haut du puits.
+//  Caméra virtuelle : le monde de destination n'est jamais déplacé.
+// =====================================================================
+const vcam = new THREE.PerspectiveCamera(75, 1, 0.02, 500);
+const holeGeo = new THREE.CircleGeometry(HR + 0.004, 48);
+holeGeo.rotateX(-Math.PI / 2);
+const holeScene = new THREE.Scene();
+const holeStencil = new THREE.Mesh(holeGeo, stencilQuadMat);
+const holeDepth   = new THREE.Mesh(holeGeo, depthQuadMat);
+holeStencil.frustumCulled = holeDepth.frustumCulled = false;
+holeScene.add(holeStencil, holeDepth);
+
+const planeShedBelow = new THREE.Plane(new THREE.Vector3(0, -1, 0), HOLE_S.y);   // garde y <= haut du puits
+const planeAbove = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);               // garde y >= plan de l'ouverture
+const keepAbove = (y) => { planeAbove.constant = -y; return planeAbove; };
+
+const mOS = new THREE.Matrix4(), mSO = new THREE.Matrix4(), _ma = new THREE.Matrix4(), _mb = new THREE.Matrix4(), _vm = new THREE.Matrix4();
+const _h = new THREE.Vector3();
+function setPortalMatrix(out, from, to, rot) {       // p -> to + Ry(rot) (p - from)
+  out.makeTranslation(to.x, to.y, to.z);
+  out.multiply(_ma.makeRotationY(rot));
+  out.multiply(_mb.makeTranslation(-from.x, -from.y, -from.z));
+  return out;
+}
+function setVirtualCamera(portalMat) {
+  _vm.multiplyMatrices(portalMat, camera.matrixWorld);
+  _vm.decompose(vcam.position, vcam.quaternion, vcam.scale);
+  vcam.projectionMatrix.copy(camera.projectionMatrix);
+  vcam.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+  vcam.updateMatrixWorld(true);
+}
+function markHole(pos, k) {
+  holeStencil.position.copy(pos); holeDepth.position.copy(pos);
+  stencilQuadMat.stencilRef = k; depthQuadMat.stencilRef = k;
+  holeStencil.visible = true;  holeDepth.visible = false;
+  renderer.render(holeScene, camera);
+  holeStencil.visible = false; holeDepth.visible = true;
+  renderer.render(holeScene, camera);
+}
+function drawWorld(target, cam, plane, ref) {
+  const p = cam === camera ? camPos : cam.position;
+  renderer.clippingPlanes = plane ? [plane] : [];
+  if (target === 'shed') {
+    setStencil(shedMats, ref); renderer.render(shedScene, cam); setStencil(shedMats, 0);
+  } else if (target === 'room') {
+    roomRoot.position.set(0, 0, 0);
+    setStencil(roomMats, ref); renderer.render(roomScene, cam); setStencil(roomMats, 0);
+  } else {
+    sky.position.copy(p); updateTiles(p);
+    setStencil(outMats, ref); renderer.render(outScene, cam); setStencil(outMats, 0);
+  }
+  renderer.clippingPlanes = [];
+}
+function drawHoleFromOrigin(O) {      // on regarde dans le tonneau : on voit la cabane
+  markHole(_h.set(O.x, O.y + 0.0015, O.z), HOLE_REF);
+  setPortalMatrix(mOS, O, HOLE_S, -bp.yaw);
+  setVirtualCamera(mOS);
+  drawWorld('shed', vcam, planeShedBelow, HOLE_REF);
+}
+function drawHoleFromShed(O) {        // on regarde vers le haut du puits : on voit le monde d'origine
+  markHole(HOLE_S, HOLE_REF);
+  setPortalMatrix(mSO, HOLE_S, O, bp.yaw);
+  setVirtualCamera(mSO);
+  drawWorld(bp.world, vcam, keepAbove(O.y), HOLE_REF);
+}
+function renderHoleTunnel(O) {        // caméra à cheval sur le plan de l'ouverture : les deux demi-espaces, sans quad
+  if (world === 'shed') {
+    drawWorld('shed', camera, planeShedBelow, 0);
+    setPortalMatrix(mSO, HOLE_S, O, bp.yaw); setVirtualCamera(mSO);
+    drawWorld(bp.world, vcam, keepAbove(O.y), 0);
+  } else {
+    drawWorld(world, camera, keepAbove(O.y), 0);
+    setPortalMatrix(mOS, O, HOLE_S, -bp.yaw); setVirtualCamera(mOS);
+    drawWorld('shed', vcam, planeShedBelow, 0);
+  }
+}
+function holeVisible(pos) {
+  if (camPos.distanceTo(pos) > 45) return false;
+  tmpBox.min.set(pos.x - 0.4, pos.y - 0.1, pos.z - 0.4);
+  tmpBox.max.set(pos.x + 0.4, pos.y + 0.1, pos.z + 0.4);
+  return frustum.intersectsBox(tmpBox);
+}
+
+// =====================================================================
+//  Rendu d'une image
+// =====================================================================
+function renderScene() {
+  player.updateMatrixWorld(true);
+  camera.getWorldPosition(camPos);
+  projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projScreen);
+
+  renderer.clippingPlanes = [];
+  renderer.setClearColor(world === 'shed' ? SHED_CLEAR : (world === 'room' ? FOG_COLOR : ROOM_CLEAR), 1);
+  renderer.clear(true, true, true);
+
+  // --- Dans la cabane / le puits
+  if (world === 'shed') {
+    const inMouth = Math.hypot(camPos.x - HOLE_S.x, camPos.z - HOLE_S.z) < HR * 1.3;
+    if (inMouth && Math.abs(camPos.y - HOLE_S.y) < 0.12) { renderHoleTunnel(link.O); return; }
+    drawWorld('shed', camera, null, 0);
+    if (camPos.y < HOLE_S.y && holeVisible(HOLE_S)) drawHoleFromShed(link.O);
+    return;
+  }
+
+  sky.position.copy(camPos);
+  updateTiles(camPos);
+
+  // --- Tête à hauteur de l'ouverture du tonneau
+  if (tube && world === bp.world && Math.abs(camPos.y - link.O.y) < 0.12) {
+    renderHoleTunnel(link.O);
+    renderDoors();
+    return;
+  }
+
+  // --- Salle ou extérieur (+ portail de la porte)
+  const dzc = camPos.z - WALL_Z;
+  const inTunnel = camPos.x > OPEN_X1 + 0.1 && camPos.x < OPEN_X2 - 0.1 &&
+                   Math.abs(dzc) < TUNNEL_HALF && camPos.y < OPEN_H;
+  const useTunnel = inTunnel && !(world === 'out' && dzc > 0);
+
+  if (useTunnel) {
+    renderTunnel();
+    if (world === 'out') drawOutPortals(true);
+  } else if (world === 'room') {
+    roomRoot.position.set(0, 0, 0);
+    setStencil(roomMats, 0);
+    renderer.render(roomScene, camera);
+    if (camPos.z > WALL_Z && portalVisible(0, 0)) drawPortal(1, 0, 0, 'out');
+  } else {
+    setStencil(outMats, 0);
+    renderer.render(outScene, camera);
+    drawOutPortals(false);
+  }
+
+  // --- Portail du tonneau (couvercle retiré, dans le monde où l'on se trouve)
+  if (!useTunnel && bp.state === 'placed' && !lidOn() && bp.world === world) {
+    const O = holeCenter(camPos);
+    if (camPos.y > O.y && holeVisible(O)) drawHoleFromOrigin(O);
+  }
+  renderDoors();
+}
+
+function drawHeld() {               // le tonneau porté : dessiné par-dessus, sans jamais traverser les murs
+  const out = world === 'out';
+  holdLight.color.set(out ? 0xdfeeff : 0xffffff);
+  holdLight.groundColor.set(out ? 0x4a6a35 : 0x666a74);
+  holdLight.intensity = out ? 1.1 : 1.0;
+  renderer.clearDepth();
+  renderer.clippingPlanes = [];
+  renderer.render(holdScene, camera);
+}
+
+// =====================================================================
+//  Porte : charnière physique
+// =====================================================================
+const DOOR_INERTIA = DOOR.mass * DOOR.length * DOOR.length / 3;
+let doorAngle = 0, doorVel = 0;
+
+function updateDoor(dt, vWx, vWz) {
+  const L = DOOR.length, reach = PLAYER_RADIUS + DOOR.thickness / 2;
+  function contact() {
+    const dx = Math.cos(doorAngle), dz = -Math.sin(doorAngle);
+    const px = player.position.x - DOOR.hingeX, pz = player.position.z - DOOR.hingeZ;
+    const s = Math.max(0, Math.min(L, px * dx + pz * dz));
+    let vx = px - s * dx, vz = pz - s * dz, dist = Math.hypot(vx, vz), nx, nz;
+    if (dist < 1e-6) { nx = -dz; nz = dx; dist = 0; } else { nx = vx / dist; nz = vz / dist; }
+    return { dx, dz, s, dist, nx, nz };
+  }
+  let c = contact();
+  if (c.dist < reach) {
+    const tx = c.s * c.dz, tz = -c.s * c.dx;
+    const k = tx * c.nx + tz * c.nz;
+    const vrel = (vWx * c.nx + vWz * c.nz) - doorVel * k;
+    if (vrel < 0 && Math.abs(k) > 0.05) {
+      const invM = 1 / PLAYER_MASS + (k * k) / DOOR_INERTIA;
+      const J = -(1 + DOOR.restitution) * vrel / invM;
+      doorVel += -J * k / DOOR_INERTIA;
+      doorVel = Math.max(-DOOR.maxSpeed, Math.min(DOOR.maxSpeed, doorVel));
+    }
+  }
+  doorVel -= doorAngle * DOOR.selfClose * dt;
+  doorVel *= Math.exp(-DOOR.damping * dt);
+  const fr = Math.min(Math.abs(doorVel), DOOR.friction * dt);
+  doorVel -= Math.sign(doorVel) * fr;
+  doorAngle += doorVel * dt;
+  if (doorAngle > DOOR.limit)  { doorAngle =  DOOR.limit; if (doorVel > 0) doorVel *= -DOOR.stopBounce; }
+  if (doorAngle < -DOOR.limit) { doorAngle = -DOOR.limit; if (doorVel < 0) doorVel *= -DOOR.stopBounce; }
+  leafPivot.rotation.y = doorAngle;
+  c = contact();
+  if (c.dist < reach) { const push = reach - c.dist; player.position.x += c.nx * push; player.position.z += c.nz * push; }
+}
+
+// =====================================================================
+//  Collisions statiques
+// =====================================================================
+const OUT = 0.6;
+const WALL_BACK = WALL_Z - WALL_T / 2 - OUT;
+const COLLIDERS = {
+  room: [
+    { minX: -ROOM_W / 2 - OUT, maxX: -ROOM_W / 2, minZ: WALL_BACK, maxZ: ROOM_D / 2 + OUT },
+    { minX:  ROOM_W / 2, maxX:  ROOM_W / 2 + OUT, minZ: WALL_BACK, maxZ: ROOM_D / 2 + OUT },
+    { minX: -ROOM_W / 2 - OUT, maxX: ROOM_W / 2 + OUT, minZ: ROOM_D / 2, maxZ: ROOM_D / 2 + OUT },
+    { minX: -ROOM_W / 2 - OUT, maxX: OPEN_X1, minZ: WALL_BACK, maxZ: -ROOM_D / 2 },
+    { minX: OPEN_X2, maxX: ROOM_W / 2 + OUT, minZ: WALL_BACK, maxZ: -ROOM_D / 2 },
+  ],
+  out: [
+    { minX: OPEN_X1 - CASING_W, maxX: OPEN_X1, minZ: WALL_Z - WALL_T / 2 - CASING_T, maxZ: WALL_Z + WALL_T / 2 + CASING_T },
+    { minX: OPEN_X2, maxX: OPEN_X2 + CASING_W, minZ: WALL_Z - WALL_T / 2 - CASING_T, maxZ: WALL_Z + WALL_T / 2 + CASING_T },
+  ],
+  shed: [
+    { minX: SHED.x1 - OUT, maxX: SHED.x1, minZ: SHED.z1 - OUT, maxZ: SHED.z2 + OUT },
+    { minX: SHED.x2, maxX: SHED.x2 + OUT, minZ: SHED.z1 - OUT, maxZ: SHED.z2 + OUT },
+    { minX: SHED.x1 - OUT, maxX: SHED.x2 + OUT, minZ: SHED.z1 - OUT, maxZ: SHED.z1 },
+    { minX: SHED.x1 - OUT, maxX: SHED.x2 + OUT, minZ: SHED.z2, maxZ: SHED.z2 + OUT },
+  ],
+};
+
+function pushOutOfBox(pos, b, r) {
+  const cx = Math.max(b.minX, Math.min(b.maxX, pos.x));
+  const cz = Math.max(b.minZ, Math.min(b.maxZ, pos.z));
+  const dx = pos.x - cx, dz = pos.z - cz, d2 = dx * dx + dz * dz;
+  if (d2 >= r * r) return;
+  if (d2 > 1e-8) { const d = Math.sqrt(d2); pos.x += dx / d * (r - d); pos.z += dz / d * (r - d); }
+  else {
+    const l = pos.x - b.minX, rt = b.maxX - pos.x, u = pos.z - b.minZ, dn = b.maxZ - pos.z;
+    const m = Math.min(l, rt, u, dn);
+    if (m === l) pos.x = b.minX - r; else if (m === rt) pos.x = b.maxX + r;
+    else if (m === u) pos.z = b.minZ - r; else pos.z = b.maxZ + r;
+  }
+}
+function resolveStatic() {
+  if (tube) return;
+  for (const b of COLLIDERS[world]) pushOutOfBox(player.position, b, PLAYER_RADIUS);
+}
+
+// =====================================================================
+//  Tonneau : position relative, collisions, sol
+// =====================================================================
+function barrelRel() {              // vecteur joueur -> tonneau (dans le monde courant)
+  let dx = bp.x - player.position.x, dz = bp.z - player.position.z;
+  if (world === 'out') { dx = wrapP(dx); dz = wrapP(dz); }
+  return [dx, dz];
+}
+function nearBarrel(maxD, facing) {
+  if (bp.state !== 'placed' || bp.world !== world) return false;
+  const [dx, dz] = barrelRel(), d = Math.hypot(dx, dz);
+  if (d > maxD) return false;
+  if (!facing || d < 0.6) return true;
+  return (-Math.sin(yaw) * dx - Math.cos(yaw) * dz) / d > 0.5;     // il faut être tourné vers le tonneau
+}
+const onGround = () => player.position.y - EYE_HEIGHT < bp.y + 0.3;
+
+function barrelCollide() {          // le tonneau est un obstacle tant que les pieds sont sous son bord
+  if (bp.state !== 'placed' || bp.world !== world || tube || onLadder || world === 'shed') return;
+  if (player.position.y - EYE_HEIGHT >= bp.y + BH - 0.12) return;
+  const [rx, rz] = barrelRel();
+  const dx = -rx, dz = -rz, d = Math.hypot(dx, dz), R = BR + PLAYER_RADIUS;
+  if (d < R) {
+    if (d > 1e-6) { player.position.x += dx / d * (R - d); player.position.z += dz / d * (R - d); }
+    else player.position.x += R;
+  }
+}
+function groundHeight(feet) {       // hauteur du sol sous le joueur (relief, ou dessus du tonneau)
+  const p = player.position;
+  let h = world === 'out' ? hWorld(p.x, p.z) : 0;
+  if (bp.state === 'placed' && bp.world === world) {
+    const [rx, rz] = barrelRel(), r = Math.hypot(rx, rz);
+    const top = bp.y + BH + (lidOn() ? LID_T : 0);
+    if (r < B_TOP + 0.03 && feet >= top - 0.12 && (lidOn() || r > HR)) h = Math.max(h, top);   // ouvert : plus de sol dans l'ouverture
+  }
+  return h;
+}
+function updateVertical(dt) {
+  const p = player.position;
+  let feet = p.y - EYE_HEIGHT;
+  const gh = tube ? -1e9 : groundHeight(feet);
+  if (grounded) {
+    if (feet - gh > 0.3) grounded = false;
+    else { feet += (gh - feet) * Math.min(1, dt * 14); vy = 0; }
+  }
+  if (!grounded) {
+    vy -= GRAVITY * dt;
+    feet += vy * dt;
+    if (feet <= gh && vy <= 0) { feet = gh; vy = 0; grounded = true; }
+  }
+  p.y = feet + EYE_HEIGHT;
+}
+
+// =====================================================================
+//  Porter, poser, retirer et remettre le couvercle
+// =====================================================================
+function groundUnderBarrel(x, z) {
+  let h = hWorld(x, z);
+  for (const [a, b] of [[0.4, 0], [-0.4, 0], [0, 0.4], [0, -0.4]]) h = Math.max(h, hWorld(x + a, z + b));
+  return h + 0.005;
+}
+function toggleCarry() {            // E
+  if (world === 'shed' || tube || onLadder || lid.mode === 'drag') return;
+  if (bp.state === 'carried') {
+    let x = player.position.x - Math.sin(yaw) * 1.2, z = player.position.z - Math.cos(yaw) * 1.2;
+    if (world === 'room') { x = clamp(x, -ROOM_W / 2 + 1.5, ROOM_W / 2 - 1.5); z = clamp(z, -ROOM_D / 2 + 1.5, ROOM_D / 2 - 1.5); }
+    bp.state = 'placed'; bp.world = world; bp.x = x; bp.z = z; bp.yaw = yaw;
+    bp.y = world === 'out' ? groundUnderBarrel(x, z) : 0;
+  } else if (lid.mode === 'on' && nearBarrel(2.2, true) && onGround()) {
+    bp.state = 'carried';
+  }
+}
+function startLidDrag() {           // début du clic maintenu
+  if (bp.state !== 'placed' || bp.world !== world || world === 'shed' || tube || onLadder || lid.mode !== 'on' || !onGround()) return;
+  const [dx, dz] = barrelRel(), d = Math.hypot(dx, dz);
+  if (d > 0.55 && d < 2.2 && nearBarrel(2.2, true)) { lid.mode = 'drag'; lid.dx = 0; lid.dz = 0; }
+}
+function dropLid() {                // le couvercle quitte le tonneau et tombe au sol, dans la direction où on l'a tiré
+  const d = Math.hypot(lid.dx, lid.dz) || 1, a = Math.cos(bp.yaw), b = Math.sin(bp.yaw);
+  lid.fx = lid.x; lid.fy = lid.y; lid.fz = lid.z;
+  lid.tx = lid.dx / d * 0.92; lid.tz = lid.dz / d * 0.92;
+  let gy = 0;
+  if (bp.world === 'out') gy = hWorld(bp.x + lid.tx * a + lid.tz * b, bp.z - lid.tx * b + lid.tz * a) - bp.y;
+  lid.ty = gy + 0.01;
+  lid.t = 0; lid.mode = 'fall';
+}
+function releaseLid() {             // fin du clic
+  if (lid.mode !== 'drag') return;
+  if (Math.hypot(lid.dx, lid.dz) > 0.45) dropLid();
+  else { lid.fx = lid.x; lid.fy = lid.y; lid.fz = lid.z; lid.tx = 0; lid.ty = BH; lid.tz = 0; lid.t = 0; lid.mode = 'back'; }
+}
+function closeLid() {               // F
+  if (world === 'shed' || tube || onLadder || lid.mode !== 'off' || !nearBarrel(3.2, false)) return;
+  lid.fx = lid.x; lid.fy = lid.y; lid.fz = lid.z; lid.tx = 0; lid.ty = BH; lid.tz = 0; lid.t = 0; lid.mode = 'back';
+}
+
+// =====================================================================
+//  Entrer dans le tonneau (sans animation : on tombe dans l'ouverture), sortir
+// =====================================================================
+const _a = new THREE.Vector3();
+function updateBarrelTube() {       // les pieds passent sous le bord, centre dans l'ouverture
+  if (tube || onLadder || world === 'shed' || bp.state !== 'placed' || bp.world !== world || lidOn()) return;
+  const [rx, rz] = barrelRel();
+  const top = bp.y + BH, feet = player.position.y - EYE_HEIGHT;
+  if (Math.hypot(rx, rz) < HR * 0.95 && feet <= top + 0.03 && feet > top - 0.4) {
+    link.O.copy(holeCenter(player.position));
+    tube = true; grounded = false;
+  }
+}
+function clampToMouth() {           // dans le col : le centre du joueur reste dans l'ouverture
+  if (!tube || onLadder) return;
+  const p = player.position, O = link.O, dx = p.x - O.x, dz = p.z - O.z, d = Math.hypot(dx, dz), m = HR * 0.85;
+  if (d > m) { p.x = O.x + dx / d * m; p.z = O.z + dz / d * m; }
+}
+function crossToShed() {            // la caméra passe sous le plan de l'ouverture : on change de monde
+  _a.copy(player.position).sub(link.O).applyAxisAngle(Y_AXIS, -bp.yaw).add(HOLE_S);
+  player.position.copy(_a);
+  const c = Math.cos(-bp.yaw), s = Math.sin(-bp.yaw);
+  const vx = velX * c + velZ * s, vz = -velX * s + velZ * c; velX = vx; velZ = vz;
+  yaw -= bp.yaw; player.rotation.y = yaw;
+  world = 'shed'; tube = false;
+}
+function crossToOrigin() {          // la caméra remonte au-dessus du plan de l'ouverture
+  _a.copy(player.position).sub(HOLE_S).applyAxisAngle(Y_AXIS, bp.yaw).add(link.O);
+  player.position.copy(_a);
+  const c = Math.cos(bp.yaw), s = Math.sin(bp.yaw);
+  const vx = velX * c + velZ * s, vz = -velX * s + velZ * c; velX = vx; velZ = vz;
+  yaw += bp.yaw; player.rotation.y = yaw;
+  world = bp.world; tube = true; grounded = false;
+}
+
+// =====================================================================
+//  Cabane : puits, plafond, échelle (contact réel, pas de zone d'interaction)
+// =====================================================================
+function shedLimits() {
+  const p = player.position, r = PLAYER_RADIUS;
+  if (p.y >= HOLE_S.y) {                                    // l'œil atteint le haut du puits
+    if (Math.hypot(p.x - HOLE_S.x, p.z - HOLE_S.z) < HR) crossToOrigin();
+    else { p.y = HOLE_S.y - 0.001; if (vy > 0) vy = 0; }
+    return;
+  }
+  if (p.y + 0.12 > SH) {                                    // la tête dépasse le plafond de la cabane
+    if (p.x > SHAFT.x1 && p.x < SHAFT.x2 && p.z > SHAFT.z1 && p.z < SHAFT.z2) {
+      p.x = clamp(p.x, SHAFT.x1 + r, SHAFT.x2 - r);
+      p.z = clamp(p.z, SHAFT.z1 + r, SHAFT.z2 - r);
+    } else { p.y = SH - 0.12; if (vy > 0) vy = 0; }
+  }
+}
+function tryGrabLadder() {          // accroche automatique : le corps (cercle de 0,30 m) touche les montants
+  if (world !== 'shed' || onLadder || ladderCooldown > 0) return;
+  const p = player.position;
+  const cx = clamp(p.x, LAD_FACE - 0.025, LAD_FACE + 0.025);
+  const cz = clamp(p.z, LAD_Z - 0.225, LAD_Z + 0.225);
+  if (Math.hypot(p.x - cx, p.z - cz) <= PLAYER_RADIUS + 0.005) {
+    onLadder = true; vy = 0; grounded = false; velX = velZ = 0; ladderLock = 0.4;
+  }
+}
+function releaseLadder() {          // Espace : on lâche l'échelle
+  onLadder = false; ladderCooldown = 0.5; grounded = false; vy = 2;
+  player.position.x = LAD_X - 0.3;
+}
+function updateLadder(dt, locked) {
+  const fwd = locked ? ((keys.KeyW || keys.ArrowUp) ? 1 : 0) - ((keys.KeyS || keys.ArrowDown) ? 1 : 0) : 0;
+  const dir = pitch < -0.12 ? -1 : 1;           // regard vers le bas : W descend ; regard droit ou vers le haut : W monte
+  const sp = ladderLock > 0 ? 0 : fwd * dir * ((keys.ShiftLeft || keys.ShiftRight) ? 2.4 : 1.5);
+  const p = player.position, k = Math.min(1, dt * 14);
+  vy = 0; grounded = false;
+  p.y += sp * dt;
+  climbPhase += Math.abs(sp) * dt;
+
+  if (world === 'shed') {
+    p.x += (LAD_X - p.x) * k; p.z += (LAD_Z - p.z) * k;
+    if (p.y <= EYE_HEIGHT && sp < 0) {            // en bas : on lâche l'échelle
+      p.y = EYE_HEIGHT; onLadder = false; ladderCooldown = 0.4; grounded = true; p.x = LAD_X - 0.4;
+    } else if (p.y >= HOLE_S.y && sp > 0) crossToOrigin();   // en haut : la tête sort du tonneau
+  } else {                                        // on finit de sortir : l'échelle se prolonge jusqu'au bord du tonneau
+    const O = link.O, c = Math.cos(bp.yaw), s = Math.sin(bp.yaw);
+    const dx = p.x - O.x, dz = p.z - O.z;
+    let lx = dx * c - dz * s, lz = dx * s + dz * c;
+    lx += (0 - lx) * k;
+    lz += ((p.y - O.y > 0.3 ? EDGE : 0) - lz) * k;   // on se décale sur la bordure, hors de l'ouverture
+    p.x = O.x + lx * c + lz * s; p.z = O.z - lx * s + lz * c;
+    if (p.y - EYE_HEIGHT >= O.y) {                // les pieds atteignent le bord : on est debout dessus
+      p.x = O.x + EDGE * s; p.z = O.z + EDGE * c; p.y = O.y + EYE_HEIGHT;
+      onLadder = false; tube = false; grounded = true; vy = 0; velX = velZ = 0;
+    } else if (p.y < O.y && sp < 0) crossToShed();
+  }
+}
+
+// =====================================================================
+//  Contrôles
+// =====================================================================
+const overlay = document.getElementById('overlay');
+const crosshair = document.getElementById('crosshair');
+const hintEl = document.getElementById('hint');
+const SENSITIVITY = 0.0022;
+const LID_SENS = 0.003;
+
+overlay.addEventListener('click', () => renderer.domElement.requestPointerLock());
+document.addEventListener('pointerlockchange', () => {
+  const locked = document.pointerLockElement === renderer.domElement;
+  overlay.style.display = locked ? 'none' : 'flex';
+  crosshair.style.display = locked ? 'block' : 'none';
+  if (!locked) releaseLid();
+});
+document.addEventListener('mousedown', (e) => {
+  if (e.button === 0 && document.pointerLockElement === renderer.domElement) startLidDrag();
+});
+document.addEventListener('mouseup', (e) => { if (e.button === 0) releaseLid(); });
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  if (lid.mode === 'drag') {        // la souris déplace le couvercle (et plus la caméra)
+    const rx = e.movementX * LID_SENS, fw = -e.movementY * LID_SENS;          // droite / avant, dans le repère du joueur
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const wx = rx * c - fw * s, wz = -rx * s - fw * c;                         // monde : droite = (c,0,-s), avant = (-s,0,-c)
+    const a = Math.cos(bp.yaw), b = Math.sin(bp.yaw);
+    lid.dx += wx * a - wz * b; lid.dz += wx * b + wz * a;                      // repère du tonneau
+    const d = Math.hypot(lid.dx, lid.dz);
+    if (d > 1.1) { lid.dx *= 1.1 / d; lid.dz *= 1.1 / d; }
+    if (d > 0.85) dropLid();
+    return;
+  }
+  yaw   -= e.movementX * SENSITIVITY;
+  pitch -= e.movementY * SENSITIVITY;
+  pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch));
+  player.rotation.y = yaw;
+});
+
+const keys = {};
+document.addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (e.repeat || document.pointerLockElement !== renderer.domElement) return;
+  if (e.code === 'Space') jumpQueued = true;
+  else if (e.code === 'KeyE') toggleCarry();
+  else if (e.code === 'KeyF') closeLid();
+});
+document.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+let lastHint = '';
+function updateHint(locked) {
+  let txt = '';
+  if (locked) {
+    if (onLadder) txt = 'W / S : monter ou descendre (regarde vers le bas pour descendre avec W) · Espace : lâcher';
+    else if (world === 'shed' || tube) txt = '';
+    else if (bp.state === 'carried') txt = 'E : poser le tonneau';
+    else if (lid.mode === 'drag') txt = 'Bouge la souris pour faire glisser le couvercle, puis relâche';
+    else if (bp.world !== world) txt = '';
+    else if (lid.mode === 'on' && nearBarrel(2.2, true)) txt = 'E : porter le tonneau · Clic maintenu : retirer le couvercle';
+    else if (lid.mode === 'off' && nearBarrel(3.2, false)) txt = 'Saute sur le tonneau et avance vers l’ouverture · F : remettre le couvercle';
+  }
+  if (txt !== lastHint) { lastHint = txt; hintEl.textContent = txt; hintEl.style.display = txt ? 'block' : 'none'; }
+}
+
+// ---------- Mouvements de tête ----------
+const HEAD = {
+  stepFreq: 1.6, bobVertical: 0.035, bobSide: 0.025, bobRoll: 0.006,
+  breathPeriod: 4.5, breathVertical: 0.012, breathPitch: 0.004,
+};
+let stepPhase = 0, breathTime = 0, carryMix = 0;
+
+// =====================================================================
+//  Boucle principale
+// =====================================================================
+const WALK_SPEED = 4, RUN_SPEED = 7;
+const clock = new THREE.Clock();
+let lastCamZ = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const locked = document.pointerLockElement === renderer.domElement;
+  const carrying = bp.state === 'carried';
+  ladderCooldown = Math.max(0, ladderCooldown - dt);
+  ladderLock = Math.max(0, ladderLock - dt);
+
+  // ----- Saut (ou lâcher l'échelle) -----
+  if (jumpQueued) {
+    jumpQueued = false;
+    if (onLadder) { if (world === 'shed') releaseLadder(); }
+    else if (grounded) { vy = JUMP_V * (carrying ? 0.75 : 1); grounded = false; }
+  }
+
+  if (onLadder) {
+    velX = velZ = 0;
+    updateLadder(dt, locked);
+  } else {
+    // ----- Déplacement horizontal (moins de contrôle en l'air, ralenti quand on porte le tonneau) -----
+    let ix = 0, iz = 0;
+    if (locked) {
+      ix = ((keys['KeyD'] || keys['ArrowRight']) ? 1 : 0) - ((keys['KeyA'] || keys['ArrowLeft']) ? 1 : 0);
+      iz = ((keys['KeyS'] || keys['ArrowDown'])  ? 1 : 0) - ((keys['KeyW'] || keys['ArrowUp'])   ? 1 : 0);
+    }
+    const len = Math.hypot(ix, iz);
+    const speed = ((keys['ShiftLeft'] || keys['ShiftRight']) ? RUN_SPEED : WALK_SPEED) * (carrying ? CARRY.slow : 1);
+    let tx = 0, tz = 0;
+    if (len > 0) {
+      const dxl = ix / len, dzl = iz / len, sin = Math.sin(yaw), cos = Math.cos(yaw);
+      tx = (dxl * cos + dzl * sin) * speed;
+      tz = (-dxl * sin + dzl * cos) * speed;
+    }
+    const kk = Math.min(1, dt * (grounded ? 10 : 6));
+    velX += (tx - velX) * kk;
+    velZ += (tz - velZ) * kk;
+    player.position.x += velX * dt;
+    player.position.z += velZ * dt;
+
+    resolveStatic();
+    barrelCollide();
+    tryGrabLadder();
+  }
+
+  if (world !== 'shed' && !tube) { updateDoor(dt, velX, velZ); resolveStatic(); }
+
+  // ----- Vertical : gravité, sol, dessus du tonneau, ouverture, plafond de la cabane -----
+  if (!onLadder) {
+    updateVertical(dt);
+    updateBarrelTube();
+    clampToMouth();
+    if (tube && player.position.y < link.O.y) crossToShed();
+    if (world === 'shed') shedLimits();
+  }
+
+  // ----- Espace non euclidien : l'extérieur est un tore, on se « replie » sur la tuile centrale -----
+  if (world === 'out' && !tube) {
+    const dwx = P * Math.round((player.position.x - DOOR_CX) / P);
+    const dwz = P * Math.round((player.position.z - DOOR_CZ) / P);
+    if (dwx || dwz) { player.position.x -= dwx; player.position.z -= dwz; lastCamZ -= dwz; }
+  }
+
+  updateBarrelVisuals(dt);
+
+  // ----- Lanterne -----
+  lanternLight.intensity = 1.1 + Math.sin(clock.elapsedTime * 1.7) * 0.025;
+
+  // ----- Mouvements de tête -----
+  const moveSpeed = (grounded && !onLadder) ? Math.hypot(velX, velZ) : 0;
+  const moveFactor = Math.min(moveSpeed / WALK_SPEED, 1.6);
+  const idleFactor = 1 - Math.min(moveFactor, 1);
+
+  stepPhase += moveSpeed * HEAD.stepFreq * dt;
+  const bobY    = Math.sin(stepPhase * 2) * HEAD.bobVertical * moveFactor;
+  const bobX    = Math.sin(stepPhase)     * HEAD.bobSide     * moveFactor;
+  const bobRoll = Math.sin(stepPhase)     * HEAD.bobRoll     * moveFactor;
+  const ladderBob = (onLadder && world === 'shed') ? Math.sin(climbPhase * 20) * 0.012 : 0;
+
+  breathTime += dt;
+  const breath = Math.sin(breathTime * Math.PI * 2 / HEAD.breathPeriod);
+  const breathStrength = 0.35 + 0.65 * idleFactor;
+
+  // Tonneau porté : la tête se penche sur le côté pour voir devant (décalage latéral + roulis)
+  carryMix += ((carrying ? 1 : 0) - carryMix) * Math.min(1, dt * 6);
+  camera.position.set(bobX + CARRY.lean * carryMix, bobY + ladderBob + breath * HEAD.breathVertical * breathStrength - 0.04 * carryMix, 0);
+  camera.rotation.x = pitch + breath * HEAD.breathPitch * breathStrength;
+  camera.rotation.z = bobRoll - CARRY.roll * carryMix;
+
+  holder.position.set(player.position.x, player.position.y + bobY * 0.5, player.position.z);   // le tonneau suit le regard, sans roulis
+  holder.rotation.set(pitch, yaw, 0);
+
+  // ----- Passage de la porte : décidé d'après la position de la CAMÉRA -----
+  player.updateMatrixWorld(true);
+  camera.getWorldPosition(camPos);
+  if (world !== 'shed' && !tube && camPos.x > OPEN_X1 && camPos.x < OPEN_X2) {
+    if (world === 'room' && lastCamZ >= WALL_Z && camPos.z < WALL_Z) world = 'out';
+    else if (world === 'out' && lastCamZ <= WALL_Z && camPos.z > WALL_Z) world = 'room';
+  }
+  lastCamZ = camPos.z;
+
+  doorLookMix += ((world === 'out' ? 1 : 0) - doorLookMix) * Math.min(1, dt * 4);
+  applyDoorLook();
+
+  updateHint(locked);
+  renderFrame();
+}
+
+// =====================================================================
+//  Post-process rétro
+//  Scène -> cible (avec stencil, pour les portails) -> passe plein écran :
+//  courbure CRT, pixelisation, flou, aberration chromatique, contraste,
+//  dithering de Bayer, palette de 16 couleurs, vignette.
+// =====================================================================
+const RETRO = {
+  height: 1440,      // résolution interne (nombre de lignes) ; appeler resizePost() après modification
+  block: 2,          // taille d'un « gros pixel » en pixels internes
+  blur: 0.6,
+  chroma: 0.005,
+  distort: 0.05,
+  contrast: 1.35,
+  saturation: 1.15,
+  dither: 0.05,
+  palette: 0.5,      // 0 = couleurs d'origine, 1 = palette limitée
+  vignette: 0.20,
+};
+
+const RETRO_PALETTE = [
+  0x0b0a10, 0x2a2233, 0x4b3a3a, 0x7a5230,
+  0xb07a3e, 0xd9b46a, 0xf2e6c0, 0xfff6e0,
+  0x1f3a2a, 0x3f7a3a, 0x8cc152, 0x2e3f6b,
+  0x4f86c6, 0xa9d4f0, 0x6b7078, 0xb8bcc4,
+];
+
+const postRT = new THREE.WebGLRenderTarget(8, 8, {
+  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+  format: THREE.RGBAFormat, depthBuffer: true, stencilBuffer: true,   // le stencil est indispensable aux portails
+});
+postRT.texture.generateMipmaps = false;
+
+const postMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tScene: { value: postRT.texture },
+    uRes: { value: new THREE.Vector2(8, 8) },
+    uBlock: { value: 2 }, uBlur: { value: 0 }, uChroma: { value: 0 }, uDistort: { value: 0 },
+    uContrast: { value: 1 }, uSaturation: { value: 1 },
+    uDither: { value: 0 }, uPalette: { value: 1 }, uVignette: { value: 0 },
+    uPal: { value: RETRO_PALETTE.map(h => new THREE.Vector3((h >> 16 & 255) / 255, (h >> 8 & 255) / 255, (h & 255) / 255)) },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tScene;
+    uniform vec2 uRes;
+    uniform float uBlock, uBlur, uChroma, uDistort;
+    uniform float uContrast, uSaturation, uDither, uPalette, uVignette;
+    uniform vec3 uPal[16];
+    varying vec2 vUv;
+
+    float bayer2(vec2 a) { a = floor(a); return fract(a.x / 2.0 + a.y * a.y * 0.75); }
+    float bayer4(vec2 a) { return bayer2(0.5 * a) * 0.25 + bayer2(a); }
+    float bayer8(vec2 a) { return bayer4(0.5 * a) * 0.25 + bayer2(a); }
+
+    vec3 tap(vec2 uv) { return texture2D(tScene, uv).rgb; }
+    vec3 blurTap(vec2 uv, vec2 px) {
+      vec3 c0 = tap(uv);
+      vec3 bl = c0 * 0.4 + (tap(uv + vec2(px.x, 0.0)) + tap(uv - vec2(px.x, 0.0))
+                          + tap(uv + vec2(0.0, px.y)) + tap(uv - vec2(0.0, px.y))) * 0.15;
+      return mix(c0, bl, uBlur);
+    }
+
+    void main() {
+      // Courbure d'écran CRT
+      vec2 c = (vUv - 0.5) * (1.0 + uDistort * dot(vUv - 0.5, vUv - 0.5)) / (1.0 + uDistort * 0.25);
+      vec2 suv = c + 0.5;
+      float inside = step(0.0, suv.x) * step(suv.x, 1.0) * step(0.0, suv.y) * step(suv.y, 1.0);
+
+      // Pixelation
+      vec2 grid = uRes / uBlock;
+      suv = (floor(suv * grid) * uBlock + 0.5) / uRes;
+      vec2 cell = floor(suv * grid);
+
+      // Flou + aberration chromatique
+      vec2 px = vec2(uBlock) / uRes;
+      vec2 co = (suv - 0.5) * uChroma + vec2(uChroma * 0.15, 0.0);
+      vec3 col;
+      col.r = blurTap(suv + co, px).r;
+      col.g = blurTap(suv, px).g;
+      col.b = blurTap(suv - co, px).b;
+
+      // Saturation + contrastes marqués
+      float luma = dot(col, vec3(0.299, 0.587, 0.114));
+      col = mix(vec3(luma), col, uSaturation);
+      col = clamp((col - 0.5) * uContrast + 0.5, 0.0, 1.0);
+      col = mix(col, col * col * (3.0 - 2.0 * col), 0.5);
+
+      // Dithering de Bayer + palette limitée
+      float d = bayer8(cell) - 0.5;
+      vec3 dc = col + d * uDither;
+      vec3 best = uPal[0];
+      float bd = 1.0e9;
+      for (int i = 0; i < 16; i++) {
+        vec3 df = dc - uPal[i];
+        float dd = dot(df * df, vec3(0.45, 0.9, 0.35));
+        if (dd < bd) { bd = dd; best = uPal[i]; }
+      }
+      col = mix(col, best, uPalette);
+
+      // Vignette
+      col *= 1.0 - uVignette * smoothstep(0.3, 0.75, length(vUv - 0.5));
+
+      gl_FragColor = vec4(col * inside, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+
+const postScene = new THREE.Scene();
+const postCam = new THREE.Camera();
+const postQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), postMat);
+postQuad.frustumCulled = false;
+postScene.add(postQuad);
+
+function resizePost() {
+  const h = Math.max(48, Math.round(RETRO.height));
+  const w = Math.max(48, Math.round(h * window.innerWidth / window.innerHeight));
+  postRT.setSize(w, h);
+  postMat.uniforms.uRes.value.set(w, h);
+}
+resizePost();
+
+function renderFrame() {
+  const u = postMat.uniforms;
+  u.uBlock.value = Math.max(1, Math.round(RETRO.block));
+  u.uBlur.value = RETRO.blur;           u.uChroma.value = RETRO.chroma;
+  u.uDistort.value = RETRO.distort;     u.uContrast.value = RETRO.contrast;
+  u.uSaturation.value = RETRO.saturation; u.uDither.value = RETRO.dither;
+  u.uPalette.value = RETRO.palette;     u.uVignette.value = RETRO.vignette;
+
+  renderer.setRenderTarget(postRT);
+  renderScene();
+  if (bp.state === 'carried') drawHeld();
+  renderer.clippingPlanes = [];
+  renderer.setRenderTarget(null);
+  renderer.render(postScene, postCam);
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  resizePost();
+});
+
+animate();
+</script>
+</body>
+</html>
